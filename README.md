@@ -1,5 +1,7 @@
 # Orbit - Windows Shell Replacement
 
+# INCOMPLETE WIP
+
 A complete Windows shell replacement built with [WGPUI](https://github.com/Far-Beyond-Pulsar/WGPUI), designed to replace Explorer and provide a modern, customizable desktop environment.
 
 ## ⚠️ Warning
