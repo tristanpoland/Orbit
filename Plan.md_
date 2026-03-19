@@ -1,0 +1,408 @@
+# Orbit Windows Shell Replacement - Implementation Plan
+
+## Vision & Scope
+
+### What We're Building
+Orbit is a **complete replacement** for the Windows desktop environment. This is not a skin or overlay - it's a fundamental replacement of:
+- **Explorer.exe** (desktop, taskbar, file manager)
+- **DWM (Desktop Window Manager)** (window composition, effects, decorations)
+- **Windows Shell** (the primary UI that starts after login)
+
+When a user logs into Windows with Orbit installed, they will see ZERO Microsoft UI. Everything - from the desktop wallpaper to window title bars to the taskbar - is rendered by our GPUI-based UI.
+
+### Why This Is Complex
+This is an exceptionally challenging project because:
+
+1. **DWM Replacement**: The Desktop Window Manager is deeply integrated into Windows. We must:
+   - Disable the DWM service entirely
+   - Implement our own compositor in GPUI
+   - Handle ALL window composition, transparency, and visual effects
+   - Capture and render every application window's content within custom decorations
+
+2. **Window Management**: Every application launched by the user will create windows expecting native Windows decorations. We must:
+   - Hook ALL window creation events system-wide
+   - Remove native frames/decorations from every window
+   - Draw custom title bars, buttons, and borders in GPUI
+   - Route window messages (move, resize, close, minimize) to our system
+   - Maintain perfect synchronization between window content and decorations
+
+3. **System Integration**: We're replacing core Windows components, which means:
+   - Registry modification to set ourselves as the shell
+   - Service management to disable Explorer and DWM
+   - Handling all desktop responsibilities (file icons, right-click menus, wallpaper)
+   - Process monitoring to catch new windows immediately
+
+4. **Stability**: If our shell crashes, the user has NO UI. We must be rock-solid.
+
+## Architecture Overview
+
+### Components
+
+#### 1. orbit-core (Shared Library)
+**Purpose**: Common types, IPC protocol, and utilities used by all other components.
+
+**Responsibilities**:
+- Define IPC message protocol (service ↔ UI communication)
+- Window state types (position, size, decorations, z-order)
+- Configuration structures
+- Error types and result wrappers
+- Logging setup and utilities
+
+**Key Types**:
+```rust
+struct WindowInfo {
+    hwnd: HWND,
+    process_id: u32,
+    title: String,
+    bounds: Rectangle,
+    state: WindowState,  // Normal, Minimized, Maximized, Fullscreen
+    has_custom_decorations: bool,
+}
+
+enum IpcMessage {
+    WindowCreated(WindowInfo),
+    WindowDestroyed(HWND),
+    WindowMoved(HWND, Point),
+    WindowResized(HWND, Size),
+    ServiceStatus(ServiceState),
+}
+```
+
+#### 2. orbit-wm (Window Manager Library)
+**Purpose**: Low-level window management - the dirty work of hooking and manipulating windows.
+
+**Responsibilities**:
+- Install system-wide window hooks (SetWindowsHookEx with WH_CBT)
+- Intercept window creation BEFORE it's visible
+- Remove window decorations (WS_CAPTION, WS_THICKFRAME, etc.)
+- Track all windows in a thread-safe registry
+- Handle window message routing
+- Provide API for z-order management
+
+**Technical Deep Dive - Window Hooking**:
+```rust
+// When ANY process creates a window, Windows calls our hook:
+unsafe extern "system" fn cbt_hook_proc(
+    code: i32, 
+    wparam: WPARAM, 
+    lparam: LPARAM
+) -> LRESULT {
+    if code == HCBT_CREATEWND {
+        let hwnd = HWND(wparam.0 as isize);
+        
+        // Remove native decorations IMMEDIATELY
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let new_style = style & !(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU);
+        SetWindowLongW(hwnd, GWL_STYLE, new_style);
+        
+        // Notify orbit-ui via IPC
+        send_ipc(IpcMessage::WindowCreated(get_window_info(hwnd)));
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+```
+
+**Key Features**:
+- Global hook injection (affects ALL processes)
+- Window state tracking (HashMap<HWND, WindowInfo>)
+- Safe Rust wrapper around unsafe Windows APIs
+- Thread-safe access (Arc<RwLock<WindowRegistry>>)
+
+#### 3. orbit-service (Windows Service)
+**Purpose**: System-level operations requiring SYSTEM privileges.
+
+**Responsibilities**:
+- Run as a Windows service (auto-start at boot)
+- Disable conflicting services (Explorer, DWM)
+- Install/uninstall window hooks via orbit-wm
+- Manage registry (set/restore shell)
+- IPC server for orbit-ui
+- Process monitoring (watch for new applications)
+- Emergency recovery (if orbit-ui crashes, restart or restore Explorer)
+
+**Service Management**:
+```rust
+// Disable DWM - this is CRITICAL
+fn disable_dwm() -> Result<()> {
+    let scm = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
+    let service = OpenServiceW(scm, "dwm", SERVICE_ALL_ACCESS)?;
+    
+    // Stop DWM
+    ControlService(service, SERVICE_CONTROL_STOP, &mut SERVICE_STATUS::default())?;
+    
+    // Set to disabled so it doesn't restart
+    ChangeServiceConfigW(
+        service,
+        SERVICE_NO_CHANGE,
+        SERVICE_DISABLED,  // Disable permanently
+        // ... other params
+    )?;
+    
+    Ok(())
+}
+```
+
+**Registry Management**:
+```rust
+// Set Orbit as the Windows shell
+fn set_shell() -> Result<()> {
+    let key = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        // ...
+    )?;
+    
+    // Backup original value
+    let original = RegGetValueW(key, "Shell")?;
+    RegSetValueExW(key, "Shell.backup", original)?;
+    
+    // Set Orbit
+    RegSetValueExW(key, "Shell", "C:\\Path\\To\\orbit-ui.exe")?;
+    
+    Ok(())
+}
+```
+
+**IPC Server**:
+- Named pipe server listening for orbit-ui connections
+- Bidirectional communication
+- Sends window creation/destruction events
+- Receives compositor requests from UI
+
+#### 4. orbit-ui (Main UI Application)
+**Purpose**: The actual desktop environment users see and interact with.
+
+**Responsibilities**:
+- Initialize WGPUI application
+- Implement compositor (render all windows)
+- Draw custom window decorations
+- Render desktop (wallpaper, icons, widgets)
+- Render taskbar
+- Handle user input (mouse, keyboard)
+- IPC client to orbit-service
+- Window management UI (Alt+Tab, snap assist, etc.)
+
+**Compositor Architecture**:
+```rust
+struct OrbitCompositor {
+    windows: Vec<ComposedWindow>,
+    desktop: DesktopLayer,
+    taskbar: TaskbarLayer,
+    overlay: OverlayLayer,  // tooltips, context menus, etc.
+}
+
+struct ComposedWindow {
+    hwnd: HWND,
+    content: CapturedContent,  // BitBlt'd window content
+    decorations: CustomDecorations,  // Title bar, buttons, border
+    bounds: Rectangle,
+    z_index: i32,
+}
+
+impl OrbitCompositor {
+    fn render(&self, cx: &mut gpui::Context) {
+        // Layer 1: Desktop (wallpaper, icons)
+        self.desktop.render(cx);
+        
+        // Layer 2: Windows (back to front by z_index)
+        for window in &self.windows.sort_by_z_index() {
+            // Render custom title bar
+            window.decorations.render(cx);
+            
+            // Render captured window content
+            cx.draw_texture(window.content.texture, window.bounds);
+        }
+        
+        // Layer 3: Taskbar (always on top)
+        self.taskbar.render(cx);
+        
+        // Layer 4: Overlay (tooltips, menus)
+        self.overlay.render(cx);
+    }
+}
+```
+
+**Window Content Capture**:
+```rust
+// Capture window content to render in GPUI
+fn capture_window_content(hwnd: HWND) -> Result<Texture> {
+    // Get window DC
+    let hdc = GetDC(hwnd);
+    let mem_dc = CreateCompatibleDC(hdc);
+    
+    // Create bitmap
+    let (width, height) = get_window_size(hwnd);
+    let bitmap = CreateCompatibleBitmap(hdc, width, height);
+    SelectObject(mem_dc, bitmap);
+    
+    // Copy window content
+    BitBlt(mem_dc, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
+    
+    // Convert to GPU texture
+    let pixels = get_bitmap_pixels(bitmap);
+    let texture = cx.create_texture_from_pixels(pixels, width, height);
+    
+    // Cleanup
+    ReleaseDC(hwnd, hdc);
+    DeleteDC(mem_dc);
+    DeleteObject(bitmap);
+    
+    Ok(texture)
+}
+```
+
+**Custom Window Decorations**:
+```rust
+struct WindowDecorations {
+    title_bar: TitleBar,
+    border: Border,
+}
+
+struct TitleBar {
+    title: String,
+    icon: Option<Texture>,
+    buttons: Vec<TitleBarButton>,  // Minimize, Maximize, Close
+    height: f32,
+    drag_area: Rectangle,
+}
+
+impl TitleBar {
+    fn render(&self, cx: &mut gpui::Context, window_bounds: Rectangle) {
+        let title_bar_bounds = Rectangle {
+            x: window_bounds.x,
+            y: window_bounds.y,
+            width: window_bounds.width,
+            height: self.height,
+        };
+        
+        // Background
+        cx.fill_rect(title_bar_bounds, Color::from_hex("#1e1e1e"));
+        
+        // Icon
+        if let Some(icon) = &self.icon {
+            cx.draw_texture(icon, /* ... */);
+        }
+        
+        // Title text
+        cx.draw_text(&self.title, /* ... */);
+        
+        // Buttons (minimize, maximize, close)
+        for button in &self.buttons {
+            button.render(cx);
+        }
+    }
+    
+    fn handle_click(&mut self, point: Point) -> Option<WindowAction> {
+        // Check if click is on buttons
+        for button in &self.buttons {
+            if button.bounds.contains(point) {
+                return Some(button.action);
+            }
+        }
+        
+        // Check if in drag area
+        if self.drag_area.contains(point) {
+            return Some(WindowAction::StartDrag);
+        }
+        
+        None
+    }
+}
+```
+
+## Workplan
+
+### Phase 1: Project Structure & Dependencies
+- [ ] Create Cargo workspace with four crates
+- [ ] Add WGPUI dependency from GitHub
+- [ ] Set up basic project structure
+- [ ] Create README with installation instructions
+
+### Phase 2: Core Library (orbit-core)
+- [ ] Define IPC protocol structures
+- [ ] Create configuration types
+- [ ] Implement logging setup
+- [ ] Add error types
+
+### Phase 3: Window Manager (orbit-wm)
+- [ ] Implement window creation hooks (SetWindowsHookEx)
+- [ ] Create window state tracking system
+- [ ] Implement frame removal for child processes
+- [ ] Add window message interceptor
+- [ ] Create Z-order management
+- [ ] Implement window focus handling
+- [ ] Add window snapping/tiling logic
+
+### Phase 3.5: Service Layer (orbit-service)
+- [ ] Implement Windows service boilerplate
+- [ ] Add DWM replacement/disabling
+- [ ] Implement Explorer.exe termination logic
+- [ ] Add registry management (shell replacement)
+- [ ] Create service installer/uninstaller
+- [ ] Implement IPC server
+- [ ] Integrate window manager hooks
+
+### Phase 4: UI Layer (orbit-ui)
+- [ ] Set up WGPUI application
+- [ ] Implement compositor (replace DWM functionality)
+- [ ] Create custom window decorations (title bar, buttons, borders)
+- [ ] Implement desktop component
+- [ ] Add taskbar component
+- [ ] Create window thumbnail rendering
+- [ ] Implement Alt+Tab switcher
+- [ ] Create sample UI elements
+- [ ] Connect to service via IPC
+- [ ] Integrate window manager for child process windows
+
+### Phase 5: Integration & Testing
+- [ ] Test service installation
+- [ ] Verify display hijacking
+- [ ] Test shell replacement
+- [ ] Create uninstall/restore functionality
+
+## Technical Notes
+
+### Window Management & DWM Replacement Strategy
+
+**DWM Replacement:**
+- Disable DWM service (dwm.exe) via service manager
+- Implement our own compositor in GPUI
+- Handle all window composition, transparency, and effects
+- Direct rendering to display using GPUI/WGPU
+
+**Window Decoration:**
+- Hook window creation (WH_CBT, HCBT_CREATEWND)
+- Remove WS_CAPTION, WS_THICKFRAME, WS_SYSMENU styles
+- Render custom title bars in GPUI
+- Implement custom minimize/maximize/close buttons
+- Handle window dragging, resizing via raw input
+
+**Window Tracking:**
+- Monitor all process creation
+- Track HWND → window metadata mapping
+- Capture window content using DWM APIs or BitBlt
+- Render captured content within GPUI decorations
+- Update on WM_PAINT and frame events
+
+**Z-Order Management:**
+- Maintain our own window stack
+- Handle SetWindowPos, BringToFront events
+- Implement proper focus management
+- Support always-on-top windows
+
+### Shell Replacement
+- Modify registry: `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell`
+- Default value: `explorer.exe` → `orbit-ui.exe`
+- Backup original value for restoration
+
+### Security Considerations
+- Service requires SYSTEM privileges
+- UI runs in user context
+- Secure IPC channel between service and UI
+- Administrator rights required for installation
+
+### Dependencies
+- WGPUI: https://github.com/Far-Beyond-Pulsar/WGPUI
+- windows-service crate for service management
+- winapi for Windows APIs
+- tokio for async operations
