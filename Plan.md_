@@ -310,99 +310,638 @@ impl TitleBar {
 }
 ```
 
-## Workplan
+## Critical Technical Challenges
 
-### Phase 1: Project Structure & Dependencies
-- [ ] Create Cargo workspace with four crates
-- [ ] Add WGPUI dependency from GitHub
-- [ ] Set up basic project structure
-- [ ] Create README with installation instructions
+### Challenge 1: Window Content Updates
+**Problem**: When an application redraws its content (e.g., video playing, text being typed), we need to capture and display those updates in real-time.
+
+**Solution Options**:
+1. **Polling with BitBlt**: Capture window content every frame (16ms for 60fps)
+   - Pros: Simple, works with all applications
+   - Cons: CPU intensive, may miss updates
+
+2. **WM_PAINT Hooking**: Hook WM_PAINT messages to know when to recapture
+   - Pros: More efficient, update only when needed
+   - Cons: Some apps bypass WM_PAINT
+
+3. **DWM Shared Surfaces**: Use DWM APIs to access the window's GPU texture
+   - Pros: Zero-copy, GPU efficient
+   - Cons: Complex, requires DWM to be partially running
+
+**Recommended**: Start with Option 1 (polling), optimize to Option 3 later.
+
+### Challenge 2: Input Routing
+**Problem**: User clicks on a window we're rendering. How do we send that input to the actual application?
+
+**Solution**:
+```rust
+fn handle_mouse_click(&self, point: Point) {
+    // Find which window was clicked
+    let window = self.windows.iter()
+        .find(|w| w.bounds.contains(point))
+        .unwrap();
+    
+    // Check if click is on our decorations
+    if window.decorations.bounds.contains(point) {
+        // Handle decoration click (close button, drag, etc.)
+        window.decorations.handle_click(point);
+    } else {
+        // Transform point to window-local coordinates
+        let local_point = point - window.bounds.origin;
+        
+        // Send input to actual window
+        unsafe {
+            PostMessageW(
+                window.hwnd,
+                WM_LBUTTONDOWN,
+                /* ... */
+            );
+        }
+    }
+}
+```
+
+### Challenge 3: Z-Order and Focus Management
+**Problem**: Windows expects to control which window is on top and has focus. We need to maintain our own z-order while keeping Windows in sync.
+
+**Solution**:
+- Maintain our own z-order stack
+- When user clicks a window, call `SetForegroundWindow` to sync with Windows
+- Hook `SetWindowPos` to catch external z-order changes
+- Use `WM_ACTIVATEAPP` to track focus changes
+
+### Challenge 4: Full-Screen Applications
+**Problem**: Games and video players expect exclusive full-screen access.
+
+**Solution**:
+- Detect full-screen windows (window size == screen size, no decorations)
+- Switch to "pass-through" mode: hide our decorations, let app render directly
+- Alternative: Render full-screen apps normally but with minimal overhead
+
+### Challenge 5: Multi-Monitor Support
+**Problem**: Windows can span multiple monitors with different DPIs.
+
+**Solution**:
+- Enumerate all displays with `EnumDisplayMonitors`
+- Create separate GPUI windows for each monitor
+- Track which windows belong to which monitor
+- Handle window dragging between monitors
+- Respect per-monitor DPI settings
+
+## Data Flow Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          Windows Kernel                          │
+│  (Window creation events, process starts, input events)          │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       orbit-wm (Hook DLL)                        │
+│  • Installed system-wide via SetWindowsHookEx                    │
+│  • Runs in EVERY process that creates windows                    │
+│  • Strips decorations immediately on window creation             │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                │ IPC (Named Pipe)
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     orbit-service (Service)                      │
+│  • Runs as SYSTEM (highest privileges)                           │
+│  • Manages services (disable Explorer/DWM)                       │
+│  • Aggregates window events from orbit-wm                        │
+│  • Monitors process creation                                     │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                │ IPC (Named Pipe)
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       orbit-ui (UI Process)                      │
+│  • Runs as current user                                          │
+│  • GPUI application with compositor                              │
+│  • Renders everything user sees                                  │
+│  • Handles input, forwards to applications                       │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                    Rendering Layers                       │   │
+│  │  1. Desktop (wallpaper, icons)                            │   │
+│  │  2. Windows (content + decorations, sorted by z-index)    │   │
+│  │  3. Taskbar (always on top)                               │   │
+│  │  4. Overlays (menus, tooltips, Alt+Tab)                   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                │
+                │ Windows APIs
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Application Windows                           │
+│  (Chrome, Notepad, VSCode, etc.)                                 │
+│  • No decorations (stripped by orbit-wm)                         │
+│  • Content captured by orbit-ui via BitBlt                       │
+│  • Receive input via PostMessage from orbit-ui                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Implementation Workplan
+
+### Prerequisites Understanding
+Before starting, the implementing agent MUST understand:
+1. This is a SYSTEM-LEVEL shell replacement, not a user application
+2. Bugs can make Windows unusable (always test in a VM first)
+3. Window hooking affects EVERY process - memory leaks = system freeze
+4. DWM disabling means we're responsible for ALL visual feedback
+
+### Phase 1: Project Structure & Dependencies ✓
+- [x] Create Cargo workspace with four crates
+- [x] Add WGPUI dependency from GitHub
+- [x] Set up basic project structure
+- [x] Create README with installation instructions
 
 ### Phase 2: Core Library (orbit-core)
-- [ ] Define IPC protocol structures
-- [ ] Create configuration types
-- [ ] Implement logging setup
-- [ ] Add error types
+- [ ] Define IPC protocol types (WindowInfo, IpcMessage, etc.)
+- [ ] Create window state enums (WindowState, WindowAction)
+- [ ] Implement geometry types (Rectangle, Point, Size)
+- [ ] Add configuration structures (OrbitConfig)
+- [ ] Create error types (OrbitError with thiserror)
+- [ ] Set up tracing/logging utilities
+- [ ] Add serialization derives for all types
+
+**Deliverable**: Core library that compiles and has no dependencies on other orbit crates.
 
 ### Phase 3: Window Manager (orbit-wm)
-- [ ] Implement window creation hooks (SetWindowsHookEx)
-- [ ] Create window state tracking system
-- [ ] Implement frame removal for child processes
-- [ ] Add window message interceptor
-- [ ] Create Z-order management
-- [ ] Implement window focus handling
-- [ ] Add window snapping/tiling logic
+This is the most critical and dangerous component. Take extreme care.
 
-### Phase 3.5: Service Layer (orbit-service)
-- [ ] Implement Windows service boilerplate
-- [ ] Add DWM replacement/disabling
-- [ ] Implement Explorer.exe termination logic
-- [ ] Add registry management (shell replacement)
-- [ ] Create service installer/uninstaller
-- [ ] Implement IPC server
-- [ ] Integrate window manager hooks
+- [ ] **3.1 Basic Hook Setup**
+  - [ ] Create global hook installation function
+  - [ ] Implement CBT hook procedure (HCBT_CREATEWND)
+  - [ ] Add hook uninstallation/cleanup
+  - [ ] Test with simple app (Notepad) - verify window appears without decorations
 
-### Phase 4: UI Layer (orbit-ui)
-- [ ] Set up WGPUI application
-- [ ] Implement compositor (replace DWM functionality)
-- [ ] Create custom window decorations (title bar, buttons, borders)
-- [ ] Implement desktop component
-- [ ] Add taskbar component
-- [ ] Create window thumbnail rendering
-- [ ] Implement Alt+Tab switcher
-- [ ] Create sample UI elements
-- [ ] Connect to service via IPC
-- [ ] Integrate window manager for child process windows
+- [ ] **3.2 Window Registry**
+  - [ ] Implement thread-safe window tracking (Arc<RwLock<HashMap<HWND, WindowInfo>>>)
+  - [ ] Add window info extraction (title, bounds, process ID)
+  - [ ] Implement window enumeration for existing windows
+  - [ ] Add window destruction tracking (WM_DESTROY)
 
-### Phase 5: Integration & Testing
-- [ ] Test service installation
-- [ ] Verify display hijacking
-- [ ] Test shell replacement
-- [ ] Create uninstall/restore functionality
+- [ ] **3.3 Style Manipulation**
+  - [ ] Remove WS_CAPTION, WS_THICKFRAME, WS_SYSMENU
+  - [ ] Handle WS_EX_WINDOWEDGE and other extended styles
+  - [ ] Add special handling for dialogs (some need certain styles)
+  - [ ] Test with various applications (Chrome, VSCode, games)
+
+- [ ] **3.4 IPC Client (to service)**
+  - [ ] Connect to orbit-service named pipe
+  - [ ] Send window creation events
+  - [ ] Send window destruction events
+  - [ ] Handle disconnection gracefully (don't crash apps!)
+
+**Deliverable**: DLL that can be injected into processes and strips window decorations.
+
+**Testing Strategy**:
+```powershell
+# Test in isolation before system-wide deployment
+rundll32.exe orbit-wm.dll,InstallHooks
+notepad.exe  # Should appear without title bar
+rundll32.exe orbit-wm.dll,UninstallHooks
+```
+
+### Phase 4: Service Layer (orbit-service)
+- [ ] **4.1 Windows Service Boilerplate**
+  - [ ] Implement service entry point
+  - [ ] Add service control handler (start, stop, pause)
+  - [ ] Create installer (sc create orbit-service ...)
+  - [ ] Add uninstaller
+  - [ ] Implement logging to file (can't use stdout in service)
+
+- [ ] **4.2 Service Management**
+  - [ ] Implement Explorer.exe termination
+  - [ ] Implement DWM disabling (ChangeServiceConfig to DISABLED)
+  - [ ] Add service restoration (enable DWM, start Explorer)
+  - [ ] Create backup/restore mechanism
+
+- [ ] **4.3 Registry Management**
+  - [ ] Implement shell registry reading/writing
+  - [ ] Backup current shell value
+  - [ ] Set orbit-ui.exe as shell
+  - [ ] Implement restoration function
+  - [ ] Add validation (ensure orbit-ui.exe exists before setting)
+
+- [ ] **4.4 IPC Server**
+  - [ ] Create named pipe server
+  - [ ] Handle multiple clients (orbit-wm instances + orbit-ui)
+  - [ ] Implement message routing
+  - [ ] Add connection tracking
+  - [ ] Handle client disconnection
+
+- [ ] **4.5 Hook Management**
+  - [ ] Install orbit-wm hooks on service start
+  - [ ] Uninstall hooks on service stop
+  - [ ] Monitor hook health
+  - [ ] Reinstall if hooks fail
+
+- [ ] **4.6 Process Monitoring**
+  - [ ] Watch for process creation (CreateToolhelp32Snapshot)
+  - [ ] Track all GUI processes
+  - [ ] Notify orbit-ui of new processes
+
+**Deliverable**: Windows service that can be installed, started, and manages system state.
+
+**Testing Strategy**:
+```powershell
+# Install and test incrementally
+.\orbit-service.exe install
+Start-Service orbit-service
+# Check logs
+Get-Content C:\ProgramData\Orbit\service.log
+# Verify DWM is stopped
+Get-Service dwm  # Should be "Stopped"
+```
+
+### Phase 5: UI Layer (orbit-ui)
+This is the largest component with the most user-facing complexity.
+
+- [ ] **5.1 WGPUI Application Setup**
+  - [ ] Initialize WGPUI app
+  - [ ] Create main window (full screen, topmost)
+  - [ ] Set up render loop (60fps target)
+  - [ ] Add basic input handling
+  - [ ] Test: Display "Hello Orbit" on screen
+
+- [ ] **5.2 IPC Client (to service)**
+  - [ ] Connect to orbit-service
+  - [ ] Receive window creation events
+  - [ ] Receive window destruction events
+  - [ ] Handle reconnection if service restarts
+
+- [ ] **5.3 Desktop Layer**
+  - [ ] Render solid color background
+  - [ ] Load and display wallpaper image
+  - [ ] Implement desktop icons (later - start simple)
+  - [ ] Handle desktop right-click (later)
+
+- [ ] **5.4 Window Content Capture**
+  - [ ] Implement BitBlt-based capture
+  - [ ] Convert HBITMAP to GPU texture
+  - [ ] Cache textures (update on timer)
+  - [ ] Handle capture failures gracefully
+
+- [ ] **5.5 Custom Window Decorations**
+  - [ ] Design title bar UI (height, colors, fonts)
+  - [ ] Render title text
+  - [ ] Render window icon
+  - [ ] Implement minimize button
+  - [ ] Implement maximize button
+  - [ ] Implement close button
+  - [ ] Add hover effects
+  - [ ] Handle button clicks
+
+- [ ] **5.6 Window Composition**
+  - [ ] Create window rendering loop
+  - [ ] Sort windows by z-index
+  - [ ] Render decorations + content for each window
+  - [ ] Handle overlapping windows correctly
+  - [ ] Optimize: only render visible portions
+
+- [ ] **5.7 Input Routing**
+  - [ ] Hit-test mouse clicks (which window?)
+  - [ ] Distinguish decoration clicks vs content clicks
+  - [ ] Forward content clicks to HWND via PostMessage
+  - [ ] Handle decoration interactions (drag, resize, buttons)
+  - [ ] Implement window dragging
+  - [ ] Implement window resizing
+  - [ ] Handle keyboard input routing
+
+- [ ] **5.8 Window Management UI**
+  - [ ] Implement Alt+Tab window switcher
+  - [ ] Add window minimize (hide from display)
+  - [ ] Add window maximize (expand to full screen)
+  - [ ] Add window restore (return to original size)
+  - [ ] Implement window close (terminate process)
+
+- [ ] **5.9 Taskbar**
+  - [ ] Design taskbar layout (height, position)
+  - [ ] Render taskbar background
+  - [ ] Add start button (or equivalent)
+  - [ ] Show running applications
+  - [ ] Implement taskbar button clicks (show/hide window)
+  - [ ] Add system tray (clock, icons)
+
+- [ ] **5.10 Performance Optimization**
+  - [ ] Profile render loop
+  - [ ] Optimize window content capture
+  - [ ] Implement dirty rectangles (only redraw changed areas)
+  - [ ] Add frame pacing
+  - [ ] Monitor memory usage
+
+**Deliverable**: Functional desktop environment that can display and interact with windows.
+
+**Testing Strategy**:
+```powershell
+# Test incrementally, each feature in isolation
+.\orbit-ui.exe --test-mode  # Run without requiring service
+# Launch test apps
+notepad.exe
+# Verify:
+# - Window appears with custom decorations
+# - Can click title bar buttons
+# - Can drag window
+# - Can type in Notepad
+```
+
+### Phase 6: Integration & Hardening
+- [ ] **6.1 End-to-End Testing**
+  - [ ] Full installation test (service + UI)
+  - [ ] Reboot test (does Orbit start instead of Explorer?)
+  - [ ] Multi-window test (10+ windows open)
+  - [ ] Heavy load test (compile large project, many processes)
+
+- [ ] **6.2 Error Handling & Recovery**
+  - [ ] Add crash recovery (restart orbit-ui if it crashes)
+  - [ ] Implement safe mode (Ctrl+Alt+Del recovery)
+  - [ ] Add logging for all errors
+  - [ ] Create diagnostic tools
+
+- [ ] **6.3 Edge Cases**
+  - [ ] Test with full-screen games
+  - [ ] Test with multi-monitor setups
+  - [ ] Test with high-DPI displays
+  - [ ] Test with various window types (dialogs, splash screens)
+
+- [ ] **6.4 Uninstallation & Restoration**
+  - [ ] Verify clean uninstall
+  - [ ] Test Explorer restoration
+  - [ ] Ensure DWM re-enables correctly
+  - [ ] Verify registry is restored
+
+- [ ] **6.5 Documentation**
+  - [ ] Write installation guide
+  - [ ] Document recovery procedures
+  - [ ] Create troubleshooting guide
+  - [ ] Add developer documentation
 
 ## Technical Notes
 
-### Window Management & DWM Replacement Strategy
+## Security & Safety Considerations
 
-**DWM Replacement:**
-- Disable DWM service (dwm.exe) via service manager
-- Implement our own compositor in GPUI
-- Handle all window composition, transparency, and effects
-- Direct rendering to display using GPUI/WGPU
+### System Safety
+**CRITICAL**: This software can render Windows unusable. Implement these safeguards:
 
-**Window Decoration:**
-- Hook window creation (WH_CBT, HCBT_CREATEWND)
-- Remove WS_CAPTION, WS_THICKFRAME, WS_SYSMENU styles
-- Render custom title bars in GPUI
-- Implement custom minimize/maximize/close buttons
-- Handle window dragging, resizing via raw input
+1. **Safe Mode Escape Hatch**: 
+   - Detect if Shift key is held during startup
+   - If detected, skip Orbit and launch Explorer instead
+   - Registry: `HKEY_LOCAL_MACHINE\SOFTWARE\Orbit\SafeMode` = 1
 
-**Window Tracking:**
-- Monitor all process creation
-- Track HWND → window metadata mapping
-- Capture window content using DWM APIs or BitBlt
-- Render captured content within GPUI decorations
-- Update on WM_PAINT and frame events
+2. **Watchdog Process**:
+   - Separate lightweight process monitors orbit-ui
+   - If orbit-ui crashes, immediately launch Explorer as fallback
+   - Log crash and disable Orbit until admin investigates
 
-**Z-Order Management:**
-- Maintain our own window stack
-- Handle SetWindowPos, BringToFront events
-- Implement proper focus management
-- Support always-on-top windows
+3. **Automatic Rollback**:
+   - First boot after installation is "trial mode"
+   - Require explicit confirmation within 5 minutes
+   - If no confirmation, auto-restore Explorer
 
-### Shell Replacement
-- Modify registry: `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell`
-- Default value: `explorer.exe` → `orbit-ui.exe`
-- Backup original value for restoration
+4. **Registry Backup**:
+   - Always backup registry values before modifying
+   - Store backups in `HKEY_LOCAL_MACHINE\SOFTWARE\Orbit\Backup`
+   - Implement one-click restore
 
 ### Security Considerations
-- Service requires SYSTEM privileges
-- UI runs in user context
-- Secure IPC channel between service and UI
-- Administrator rights required for installation
 
-### Dependencies
-- WGPUI: https://github.com/Far-Beyond-Pulsar/WGPUI
-- windows-service crate for service management
-- winapi for Windows APIs
-- tokio for async operations
+1. **Service Privileges**:
+   - orbit-service runs as SYSTEM (highest privilege)
+   - Minimize attack surface - no network code in service
+   - Validate all IPC messages from orbit-ui (untrusted)
+   - Use secure named pipes (SECURITY_ATTRIBUTES)
+
+2. **Hook DLL Security**:
+   - orbit-wm DLL loads into every process
+   - Must be signed (code signing certificate)
+   - Minimize code - only hook logic, no business logic
+   - No network access, no file I/O (except logging)
+
+3. **Input Validation**:
+   - Validate all window handles before using
+   - Check process IDs before sending input
+   - Sanitize window titles (prevent injection)
+
+4. **Resource Limits**:
+   - Cap number of tracked windows (prevent DoS)
+   - Limit texture cache size (prevent OOM)
+   - Rate-limit IPC messages
+
+### Testing Requirements
+
+**DO NOT TEST ON PRODUCTION SYSTEMS**
+
+Mandatory testing environment:
+- Virtual machine (Hyper-V, VMware, VirtualBox)
+- Snapshot before installation
+- Test rollback procedures
+- Test safe mode boot
+
+Test matrix:
+- Windows 10 (21H2, 22H2)
+- Windows 11 (21H2, 22H2, 23H2)
+- Multi-monitor configurations
+- High-DPI displays (150%, 200% scaling)
+- Various applications (Office, browsers, IDEs, games)
+
+## Common Pitfalls & Solutions
+
+### Pitfall 1: Hook DLL Memory Leaks
+**Problem**: orbit-wm loads into every process. Small leak = system freeze.
+
+**Solution**:
+- Use RAII patterns everywhere
+- No global allocations
+- Profile with multiple processes
+- Use `_CrtDumpMemoryLeaks()` on Windows
+
+### Pitfall 2: Deadlocks in Hook Procedure
+**Problem**: Hook proc runs synchronously during window creation. If it blocks, creator blocks.
+
+**Solution**:
+- NEVER block in hook procedure
+- Queue events for background thread
+- Use lock-free queues (crossbeam)
+- Timeout on IPC sends (don't wait forever)
+
+### Pitfall 3: Z-Order Desync
+**Problem**: Our z-order differs from Windows' actual z-order.
+
+**Solution**:
+- Hook SetWindowPos to catch z-order changes
+- Periodically enumerate windows to verify
+- Use GetTopWindow, GetNextWindow to walk Windows' list
+- Resync on any discrepancy
+
+### Pitfall 4: Input Focus Issues
+**Problem**: User clicks window, but keyboard input goes elsewhere.
+
+**Solution**:
+- Always call SetForegroundWindow on click
+- Hook WM_SETFOCUS to track focus changes
+- Visually indicate focused window (different decoration color)
+
+### Pitfall 5: BitBlt Fails on GPU Apps
+**Problem**: Games render directly to GPU, BitBlt returns black.
+
+**Solution**:
+- Use DWM Shared Surface APIs instead
+- Fall back to BitBlt for non-GPU apps
+- Detect GPU usage (D3D11, D3D12, Vulkan window classes)
+
+## WGPUI Integration
+
+### Basic WGPUI Setup
+```rust
+use wgpui::*;
+
+fn main() {
+    App::new().run(|cx| {
+        // Create main window (full screen)
+        cx.open_window(WindowOptions {
+            title: "Orbit Desktop",
+            bounds: get_screen_bounds(),
+            decorations: false,  // No native decorations
+            always_on_top: true,
+            ..Default::default()
+        }, |cx| {
+            // Root view
+            OrbitDesktop::new(cx)
+        });
+    });
+}
+
+struct OrbitDesktop {
+    compositor: OrbitCompositor,
+}
+
+impl View for OrbitDesktop {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl Element {
+        div()
+            .size_full()
+            .child(self.compositor.render(cx))
+    }
+    
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut ViewContext<Self>) {
+        self.compositor.handle_click(event.position, cx);
+    }
+}
+```
+
+### Sample UI Structure
+```
+┌───────────────────────────────────────────────────────────┐
+│                     Desktop (Layer 1)                      │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ Window 1 (Layer 2)                            [_][□][X]│  │
+│  │ ┌─────────────────────────────────────────────────┐ │  │
+│  │ │                                                  │ │  │
+│  │ │         Captured Window Content                 │ │  │
+│  │ │         (BitBlt from actual app)                │ │  │
+│  │ │                                                  │ │  │
+│  │ └─────────────────────────────────────────────────┘ │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                             │
+│     ┌─────────────────────────────────────────────┐       │
+│     │ Window 2                            [_][□][X]│       │
+│     │ ┌─────────────────────────────────────────┐ │       │
+│     │ │                                          │ │       │
+│     │ │       Captured Window Content           │ │       │
+│     │ │                                          │ │       │
+│     │ └─────────────────────────────────────────┘ │       │
+│     └─────────────────────────────────────────────┘       │
+│                                                             │
+├───────────────────────────────────────────────────────────┤
+│  [≡] Start  [App1] [App2] [App3]             🔔 ⚙ 🔊 3:45PM │  ← Taskbar (Layer 3)
+└───────────────────────────────────────────────────────────┘
+```
+
+## Success Criteria
+
+The implementation is complete when:
+
+1. ✅ **System boots to Orbit**: After installation and reboot, user sees Orbit UI, not Windows Explorer
+2. ✅ **Applications work normally**: User can launch and use any Windows application
+3. ✅ **Window management works**: Can move, resize, minimize, maximize, close windows via custom decorations
+4. ✅ **Input is correctly routed**: Clicking and typing in applications works normally
+5. ✅ **Taskbar is functional**: Can see running apps, launch new apps
+6. ✅ **System is stable**: Can run for hours without crashes or memory leaks
+7. ✅ **Clean uninstall**: Can restore Windows to Explorer with no issues
+8. ✅ **Safe mode works**: Can boot to Explorer if Orbit has problems
+
+## Future Enhancements (Post-MVP)
+
+- Virtual desktops
+- Window tiling/snapping zones
+- Desktop widgets
+- Custom themes
+- Animation effects
+- Multi-monitor optimization
+- Touch support
+- Wayland-style security model
+- Plugin system
+
+## Resources & References
+
+### Windows APIs
+- SetWindowsHookEx: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowshookexw
+- DWM APIs: https://learn.microsoft.com/en-us/windows/win32/dwm/dwm-overview
+- Windows Services: https://learn.microsoft.com/en-us/windows/win32/services/services
+
+### Similar Projects
+- bbLean (Blackbox for Windows): Lightweight shell replacement
+- Emerge Desktop: Alternative Windows shell
+- SharpEnviro: Custom desktop environment
+- Cairo Desktop: macOS-style desktop for Windows
+
+### WGPUI
+- GitHub: https://github.com/Far-Beyond-Pulsar/WGPUI
+- Based on GPUI from Zed editor
+- GPU-accelerated UI framework
+
+## Notes for Future Agents
+
+### If You're Stuck
+1. **Check the logs**: orbit-service writes to `C:\ProgramData\Orbit\service.log`
+2. **Test in isolation**: Run orbit-ui without service first, verify WGPUI works
+3. **Test hooks separately**: Inject orbit-wm into single process before system-wide
+4. **Use Process Monitor**: Sysinternals tool shows all Windows API calls
+5. **Enable debug mode**: Set `ORBIT_DEBUG=1` environment variable
+
+### If Windows Becomes Unusable
+1. **Boot to Safe Mode**: Restart, press F8, select Safe Mode
+2. **Run recovery script**:
+   ```powershell
+   cd C:\Program Files\Orbit
+   .\tools\restore-explorer.ps1
+   ```
+3. **Manual recovery**:
+   ```powershell
+   Stop-Service orbit-service
+   sc config dwm start= auto
+   Start-Service dwm
+   reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d explorer.exe /f
+   Restart-Computer
+   ```
+
+### Code Quality Standards
+- All unsafe code must have SAFETY comments explaining why it's safe
+- All Windows API calls must be error-checked
+- All allocations in hook DLL must be freed
+- All IPC messages must have timeouts
+- All window handles must be validated before use
+
+### Debugging Tips
+- Use `OutputDebugStringW` for logging from hooks (can't use stdout)
+- Use DebugView from Sysinternals to see debug output
+- Attach WinDbg to orbit-service for kernel debugging
+- Use PIX or RenderDoc for GPU debugging
+
+---
+
+This is a complex, system-level project. Take your time, test thoroughly, and always have a recovery plan. Good luck! 🚀
