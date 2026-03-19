@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "orbit-core",
+    "orbit-wm",
+    "orbit-service",
+    "orbit-ui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Orbit Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Windows APIs
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+windows-service = "0.7"
+
+# IPC
+interprocess = "2.2"
+
+# WGPUI - from GitHub
+wgpui = { git = "https://github.com/Far-Beyond-Pulsar/WGPUI" }
